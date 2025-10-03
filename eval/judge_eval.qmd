@@ -1,0 +1,271 @@
+---
+title: "Judge Workflow Evaluation"
+format:
+  html:
+    code-fold: true
+    theme: cosmo
+    toc: false
+    html-math-method: katex
+execute-dir: project
+execute:
+  echo: true
+  warning: false
+  message: false
+  engine: python
+highlight-style: tango
+freeze: auto
+params:
+  gold_path: "eval/gold_judge.jsonl"
+  evaluation_model: "gpt-4o-mini"
+---
+
+## Overview
+
+This notebook uses an external LLM as an auditor to score the judge workflow's
+eligibility determinations.
+
+- Loads the cached judge dataset (`params.gold_path`).
+- Replays the stored trial snippets from `gold_judge.jsonl` (retrieved trials and bullet text).
+- Prompts an LLM to classify the app's output as **FULLY_CORRECT**,
+  **PARTIALLY_CORRECT**, or **INCORRECT**, along with per-trial feedback.
+- Reports distribution metrics and example rationales.
+
+## Setup
+
+```{python}
+import os
+import json
+import sys
+import math
+from pathlib import Path
+from typing import Dict, List
+
+import pandas as pd
+from tqdm.auto import tqdm
+from openai import OpenAI
+from functools import lru_cache
+
+def _find_project_root(start: Path) -> Path:
+    for candidate in [start, *start.parents]:
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    return start
+
+NOTEBOOK_DIR = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()
+PROJECT_ROOT = _find_project_root(NOTEBOOK_DIR)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+raw_gold_path = Path(params["gold_path"]) if 'params' in globals() else Path("eval/gold_judge.jsonl")
+GOLD_PATH = raw_gold_path if raw_gold_path.is_absolute() else PROJECT_ROOT / raw_gold_path
+EVAL_MODEL = params.get("evaluation_model", "gpt-4o-mini") if 'params' in globals() else "gpt-4o-mini"
+
+if not os.getenv("OPENAI_API_KEY"):
+    raise RuntimeError("OPENAI_API_KEY is required for LLM auditing")
+
+@lru_cache(maxsize=1)
+def _get_client() -> OpenAI:
+    return OpenAI()
+
+settings = {
+    "gold_path": str(GOLD_PATH),
+    "evaluation_model": EVAL_MODEL,
+}
+settings
+```
+
+## Load Judge Dataset
+
+```{python}
+def iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+if not GOLD_PATH.exists():
+    raise FileNotFoundError(f"Judge dataset not found: {GOLD_PATH}")
+
+gold_rows = list(iter_jsonl(GOLD_PATH))
+len(gold_rows)
+```
+
+## Helper Functions
+
+```{python}
+def build_trial_snippets(row: Dict) -> List[Dict]:
+    trials: List[Dict] = row.get("retrieved_trials") or []
+    limited: List[Dict] = []
+    for trial in trials:
+        limited.append(
+            {
+                "nct_id": trial.get("nct_id"),
+                "eligibility_app": None,
+                "trial_title": trial.get("trial_title"),
+                "overall_status": trial.get("overall_status"),
+                "conditions": trial.get("conditions") or [],
+                "interventions": trial.get("interventions") or [],
+                "inclusion_bullets": trial.get("inclusion_bullets") or [],
+                "exclusion_bullets": trial.get("exclusion_bullets") or [],
+            }
+        )
+    app_results = row.get("judge_results") or []
+    verdict_map = {item.get("nct_id"): item for item in app_results}
+    for trial in limited:
+        verdict = verdict_map.get(trial["nct_id"])
+        if verdict:
+            trial["eligibility_app"] = verdict.get("eligibility")
+            trial["app_explanation"] = verdict.get("explanation")
+        else:
+            trial["eligibility_app"] = None
+    return limited
+
+
+def build_audit_prompt(row: Dict) -> Dict:
+    spec = row.get("query_spec") or {}
+    trials = build_trial_snippets(row)
+    payload = {
+        "patient_query": row.get("query"),
+        "patient_spec": spec,
+        "app_labels": [
+            {
+                "nct_id": item.get("nct_id"),
+                "eligibility": item.get("eligibility"),
+                "explanation": item.get("explanation"),
+            }
+            for item in (row.get("judge_results") or [])
+        ],
+        "trial_snippets": trials,
+    }
+    return payload
+
+
+AUDITOR_SYSTEM_PROMPT = (
+    "You are auditing eligibility decisions for clinical trial retrieval.\n"
+    "You will receive a patient specification, the app's eligibility labels for each trial,\n"
+    "and the relevant inclusion/exclusion bullets. Assess whether the app's labels are\n"
+    "correct.\n\n"
+    "Output a JSON object with keys: overall_assessment, summary, per_trial.\n"
+    "overall_assessment must be one of: FULLY_CORRECT, PARTIALLY_CORRECT, INCORRECT.\n"
+    "Use PARTIALLY_CORRECT when some trials are labeled correctly and others not.\n"
+    "per_trial must be a list of objects with keys: nct_id, assessment, rationale,\n"
+    "expected_label. assessment must be CORRECT, PARTIALLY_CORRECT, or INCORRECT.\n"
+    "expected_label should reflect the auditor's view (POSSIBLY ELIGIBLE or INELIGIBLE).\n"
+    "Stick to valid JSON. Do not wrap the JSON in markdown fences."
+)
+```
+
+## Audit Judge Outputs
+
+```{python}
+#| output: false
+
+audit_rows: List[Dict] = []
+client = _get_client()
+progress = tqdm(enumerate(gold_rows, start=1), total=len(gold_rows), desc="Auditing judge outputs", unit="query", dynamic_ncols=True, leave=False)
+
+for idx, row in progress:
+    payload = build_audit_prompt(row)
+    try:
+        response = client.chat.completions.create(
+            model=EVAL_MODEL,
+            messages=[
+                {"role": "system", "content": AUDITOR_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content or "{}"
+        audit = json.loads(content)
+    except Exception as e:
+        audit = {
+            "overall_assessment": "ERROR",
+            "summary": f"Audit failed: {e}",
+            "per_trial": [],
+        }
+    audit_rows.append(
+        {
+            "query": row.get("query"),
+            "target_nct_id": row.get("target_nct_id"),
+            "target_rank": row.get("target_rank"),
+            "snapshot": row.get("snapshot"),
+            "overall_assessment": audit.get("overall_assessment", "ERROR"),
+            "summary": audit.get("summary"),
+            "per_trial": audit.get("per_trial", []),
+        }
+    )
+progress.close()
+len(audit_rows)
+```
+
+## Metrics
+
+```{python}
+df = pd.DataFrame(audit_rows)
+assessment_counts = df["overall_assessment"].value_counts().rename_axis("assessment").reset_index(name="count")
+assessment_counts["fraction"] = assessment_counts["count"] / len(df)
+assessment_counts
+```
+
+```{python}
+accuracy = (df["overall_assessment"] == "FULLY_CORRECT").mean()
+partial_rate = (df["overall_assessment"] == "PARTIALLY_CORRECT").mean()
+error_rate = (df["overall_assessment"] == "INCORRECT").mean()
+metrics = {
+    "total_queries": len(df),
+    "fully_correct_rate": round(float(accuracy), 4),
+    "partially_correct_rate": round(float(partial_rate), 4),
+    "incorrect_rate": round(float(error_rate), 4),
+}
+metrics
+```
+
+### Metrics Table
+
+```{python}
+from great_tables import GT
+
+metrics_df = pd.DataFrame([
+    {"Metric": "Fully correct", "Value": f"{metrics['fully_correct_rate']:.4f}", "Notes": "overall_assessment = FULLY_CORRECT"},
+    {"Metric": "Partially correct", "Value": f"{metrics['partially_correct_rate']:.4f}", "Notes": "PARTIALLY_CORRECT"},
+    {"Metric": "Incorrect", "Value": f"{metrics['incorrect_rate']:.4f}", "Notes": "INCORRECT"},
+    {"Metric": "Evaluated queries", "Value": f"{metrics['total_queries']:,}", "Notes": "rows audited"},
+])
+
+GT(metrics_df).tab_header(title="Judge Workflow Audit Metrics").cols_align(columns="Value", align="right")
+```
+
+## Sample Findings
+
+```{python}
+def preview_examples(df: pd.DataFrame, label: str, limit: int = 5) -> List[Dict]:
+    subset = df[df["overall_assessment"] == label]
+    out: List[Dict] = []
+    for _, row in subset.head(limit).iterrows():
+        out.append(
+            {
+                "overall_assessment": row["overall_assessment"],
+                "summary": row["summary"],
+                "target_nct_id": row["target_nct_id"],
+                "target_rank": row["target_rank"],
+            }
+        )
+    return out
+
+{
+    "fully_correct_examples": preview_examples(df, "FULLY_CORRECT"),
+    "partial_examples": preview_examples(df, "PARTIALLY_CORRECT"),
+    "incorrect_examples": preview_examples(df, "INCORRECT"),
+}
+```
+
+## Notes
+
+- Each audited row incurs one additional LLM call using `params.evaluation_model`.
+- The audit consumes whatever context was stored in `gold_judge.jsonl`.
+- For large datasets, consider sampling rows before auditing to control cost.

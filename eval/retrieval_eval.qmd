@@ -1,0 +1,195 @@
+---
+title: "Retrieval Evaluation (Hit@K, MRR@K)"
+format:
+  html:
+    code-fold: true
+    theme: cosmo
+    toc: false
+    html-math-method: katex
+execute-dir: project
+execute:
+  echo: true
+  warning: false
+  message: false
+  engine: python
+highlight-style: tango 
+freeze: auto
+params:
+  gold_path: "eval/gold_retrieval.jsonl"
+  k: 10
+---
+
+## Overview
+
+This notebook evaluates the retrieval component using a gold dataset of (query, nct_id) pairs.
+
+- Computes Hit@K and MRR@K (K = `params.k`)
+- Uses the app's retrieval pipeline (`clinical_rag.retrieval.retrieve_with_exclusions`)
+- Assumes Qdrant is running and the collection is populated
+
+## Setup
+
+```{python}
+import os, json, sys
+from pathlib import Path
+from typing import Dict, Iterator, List
+
+def _find_project_root(start: Path) -> Path:
+    for candidate in [start, *start.parents]:
+        if (candidate / "pyproject.toml").exists():
+            return candidate
+    return start
+
+NOTEBOOK_DIR = Path(__file__).resolve().parent if '__file__' in globals() else Path.cwd()
+PROJECT_ROOT = _find_project_root(NOTEBOOK_DIR)
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from clinical_rag.config import load_settings
+from clinical_rag.retrieval import retrieve_with_exclusions
+from qdrant_client import QdrantClient
+from tqdm.auto import tqdm
+
+raw_gold_path = Path(params["gold_path"]) if 'params' in globals() else Path("eval/gold_retrieval.jsonl")
+GOLD_PATH = raw_gold_path if raw_gold_path.is_absolute() else PROJECT_ROOT / raw_gold_path
+K = int(params["k"]) if 'params' in globals() else 10
+
+settings = load_settings()
+settings
+```
+
+### Qdrant Connectivity Check
+
+```{python}
+client = QdrantClient(url=settings.qdrant_url)
+try:
+    # Lightweight check: list collections, or count on the configured collection
+    try:
+        info = client.get_collection(settings.collection_name)
+        print(f"Collection: {settings.collection_name}")
+        print(f"Vectors count (approx): {getattr(info, 'points_count', 'unknown')}")
+    except Exception:
+        # Fallback to count
+        total = client.count(settings.collection_name, exact=False)
+        print(f"Collection: {settings.collection_name}, count={getattr(total, 'count', total)}")
+    print("Qdrant reachable ✅")
+except Exception as e:
+    print("Qdrant not reachable ❌:", e)
+    raise
+```
+
+## Load Gold Dataset
+
+```{python}
+def iter_jsonl(path: Path):
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                yield json.loads(line)
+            except Exception:
+                continue
+
+if not GOLD_PATH.exists():
+    raise FileNotFoundError(f"Gold file not found: {GOLD_PATH}")
+
+gold_rows = list(iter_jsonl(GOLD_PATH))
+len(gold_rows)
+```
+
+## Evaluate Retrieval (Hit@K, MRR@K)
+
+```{python}
+#| output: false
+
+hits = 0
+reciprocal_ranks: List[float] = []
+misses: List[Dict] = []
+
+N = len(gold_rows)
+progress = tqdm(gold_rows, total=N, desc="Evaluating retrieval", unit="query", dynamic_ncols=True, leave=False)
+
+for i, row in enumerate(progress, start=1):
+    q = (row.get("query") or "").strip()
+    gold = (row.get("nct_id") or "").strip()
+    if not q or not gold:
+        reciprocal_ranks.append(0.0)
+        continue
+
+    spec = row.get("query_spec")
+    if isinstance(spec, str):
+        try:
+            spec = json.loads(spec)
+        except json.JSONDecodeError as e:
+            progress.close()
+            raise ValueError(f"Row {i} has invalid query_spec JSON") from e
+    if not isinstance(spec, dict):
+        progress.close()
+        raise ValueError(f"Row {i} missing valid query_spec; aborting evaluation")
+
+    try:
+        grouped = retrieve_with_exclusions(spec, max_trials=K)
+        ranking = list(grouped.keys())
+        r = ranking.index(gold) + 1 if gold in ranking else 0
+        if r and r <= K:
+            hits += 1
+            reciprocal_ranks.append(1.0 / r)
+        else:
+            reciprocal_ranks.append(0.0)
+            if len(misses) < 10:
+                misses.append({"query": q, "gold": gold, "ranking": ranking})
+    except Exception as e:
+        reciprocal_ranks.append(0.0)
+        if len(misses) < 10:
+            misses.append({"query": q, "gold": gold, "error": str(e)})
+
+progress.close()
+
+hit_rate = hits / N if N else 0.0
+mrr = sum(reciprocal_ranks) / N if N else 0.0
+
+summary = {
+    "gold": str(GOLD_PATH),
+    "k": K,
+    "evaluated": N,
+    "hits": hits,
+    "hit_rate": hit_rate,
+    "mrr": mrr,
+}
+summary
+```
+
+### Metrics Table
+
+```{python}
+import pandas as pd
+from great_tables import GT
+
+metrics_df = pd.DataFrame([
+    {"Metric": "Hit@K", "Value": f"{summary['hit_rate']:.4f}", "Notes": f"K={summary['k']}"},
+    {"Metric": "MRR@K", "Value": f"{summary['mrr']:.4f}", "Notes": f"K={summary['k']}"},
+    {"Metric": "Evaluated", "Value": f"{summary['evaluated']:,}", "Notes": "queries"},
+    {"Metric": "Hits", "Value": f"{summary['hits']:,}", "Notes": "retrieved within K"},
+])
+
+metrics_table = (
+    GT(metrics_df)
+    .tab_header(title="Retrieval Evaluation Metrics")
+    .cols_align(columns="Value", align="right")
+)
+
+metrics_table
+```
+
+### Sample Misses (up to 10)
+
+```{python}
+misses
+```
+
+## Notes
+
+- This is a simple offline retrieval evaluation using the app’s own pipeline.
+- To compare versions (e.g., different embeddings or filters), re-run after ingesting to a new collection or snapshot.
