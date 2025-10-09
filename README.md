@@ -75,7 +75,7 @@ Build the Streamlit container and bring up Qdrant (local vector database).
 ```bash
 make up  
 # After startup the URLs are printed:
-# - Streamlit UI: http://localhost:8501
+# - TrialGPT: http://localhost:8501
 # - Qdrant dashboard: http://localhost:6333/dashboard
 ```
 
@@ -88,28 +88,27 @@ Useful companions:
 ### 5. Load the Qdrant Database with Clinical Trials
 
 ```bash
-make pipeline-demo  # download a small set of trials and upsert them
+make load-archive-qd  # downloads and restores an archived snapshot (dated **September 19, 2025**)
 ```
 
 Additional options are as follows:
 
-> **Options for Adding Data to Qdrant (Choose one)**
+> **Alternative Options for Adding Data to Qdrant (run `make down-clean` and choose one):**
 >
 > - `make pipeline-demo` downloads only ~50 trials and upserts them—ideal for smoke testing.
 > - `make pipeline` runs the full ingest (all pages in the configured date window) and pushes directly to Qdrant.
-> - `make load-archive-qd` downloads and restores a full snapshot (dated **September 19, 2025**) that powers the evaluation notebooks.
 > - `make down-clean` stop stack and remove named volumes (clears Qdrant data).
 
 ### 6. Visit the App
 
-Open http://localhost:8501 in your browser. With the shared snapshot (September 19, 2025) in place, try a query such as `“65 y/o male with non-small cell lung cancer”` to see eligible trials.
+Open http://localhost:8501 in your browser. With the shared snapshot (September 19, 2025) in place, fill in the age, sex, and location dropdowns and try a query such as `“male with Type 2 diabetes, preference for telemedicine”` to see eligible trials.
 
 ### (Optional) CLI Smoke Tests
 
 Run targeted CLI flows without opening the UI (Qdrant must be running):
 
 ```bash
-make parse-text TEXT="65 year old woman with type 2 diabetes"
+make parse-text TEXT="male with Type 2 diabetes, preference for telemedicine"
 make retrieve-text TEXT="..."
 make judge-text TEXT="..."
 ```
