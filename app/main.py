@@ -1,16 +1,66 @@
 import json
+from typing import Any, Iterable, List, Tuple
+
 import streamlit as st
 
 from clinical_rag.config import load_settings
 from clinical_rag.query_parser import parse
-from clinical_rag.retrieval import retrieve_with_exclusions
+from clinical_rag.retrieval import retrieve_with_exclusions, get_location_facets
 from clinical_rag.judge import judge_grouped
+
+
+@st.cache_data(show_spinner=False)
+def _load_location_facets() -> dict:
+    try:
+        return get_location_facets()
+    except Exception as exc:  # pragma: no cover - defensive UI fallback
+        st.warning(f"Unable to load location filters: {exc}")
+        return {"countries": [], "states_by_country": {}, "cities_by_region": {}}
+
+
+def _label_for(value: Any) -> str:
+    if value is None:
+        return "Not specified"
+    if isinstance(value, str):
+        value = value.strip()
+        return value.title() if value else "Not specified"
+    return str(value)
+
+
+def _make_options(values: Iterable[Any]) -> List[Tuple[str, Any]]:
+    opts: List[Tuple[str, Any]] = [("Not specified", None)]
+    for val in values:
+        if val is None:
+            continue
+        opts.append((_label_for(val), val))
+    return opts
+
+
+def _selectbox_with_reset(
+    label: str,
+    options: List[Tuple[str, Any]],
+    *,
+    key: str,
+    disabled: bool = False,
+) -> Any:
+    if not options:
+        options = [("Not specified", None)]
+    if key not in st.session_state or st.session_state[key] not in options:
+        st.session_state[key] = options[0]
+    selected: Tuple[str, Any] = st.selectbox(  # type: ignore[assignment]
+        label,
+        options,
+        key=key,
+        format_func=lambda opt: opt[0] if opt else "Not specified",
+        disabled=disabled,
+    )
+    return selected[1] if selected else None
 
 
 def main() -> None:
     # ---------- Page config ----------
     st.set_page_config(
-        page_title="Clinical Trials Finder",
+        page_title="TrialGPT",
         page_icon="🏥",
         layout="centered",
         initial_sidebar_state="collapsed",
@@ -40,6 +90,11 @@ def main() -> None:
       border-radius: 10px;
       border-left: 4px solid #2196f3;
       margin-top: .75rem;
+      margin-bottom: .75rem;
+  }
+
+  .search-info {
+      margin-top: 0.75rem;
   }
 
   .elig-ELIGIBLE { background: #d4edda; color: #155724; padding: 0.2rem 0.45rem; border-radius: 6px; font-size: 0.8rem; font-weight: 700; }
@@ -83,22 +138,58 @@ def main() -> None:
         unsafe_allow_html=True,
     )
 
+    location_facets = _load_location_facets()
+
+    age_options = _make_options(range(0, 121))
+    sel_age = _selectbox_with_reset("Age", age_options, key="filter_age")
+
+    sex_options = _make_options(["FEMALE", "MALE"])
+    sel_sex = _selectbox_with_reset("Sex", sex_options, key="filter_sex")
+
+    country_options = _make_options(location_facets.get("countries", []))
+    sel_country = _selectbox_with_reset(
+        "Country", country_options, key="filter_country"
+    )
+    sel_country_key = (sel_country or "").lower()
+
+    states = (
+        location_facets.get("states_by_country", {}).get(sel_country_key, [])
+        if sel_country_key
+        else []
+    )
+    state_options = _make_options(states)
+    sel_state = _selectbox_with_reset(
+        "State / Province",
+        state_options,
+        key="filter_state",
+        disabled=not states,
+    )
+    sel_state_key = (sel_state or "").lower() if sel_state else ""
+
+    city_key = (sel_country_key, sel_state_key)
+    cities = (
+        location_facets.get("cities_by_region", {}).get(city_key, [])
+        if sel_country_key
+        else []
+    )
+    city_options = _make_options(cities)
+    sel_city = _selectbox_with_reset(
+        "City",
+        city_options,
+        key="filter_city",
+        disabled=not cities,
+    )
+
     with st.form(key="search_form", clear_on_submit=False):
         st.markdown(
             """
-Please provide the following details (more information → better results):
-
-- Age and sex (e.g., 30, male)
-- Conditions and comorbidities (e.g., sickle cell disease; hypertension)
-- Current medications (e.g., hydroxyurea)
-- Location: city, state, country; optional radius (e.g., within 50 km)
-- Preferences (extra terms): short phrases like "oral therapy", "telemedicine",
-  "double-blind", "minimal clinic visits"
+Describe the patient's condition(s), therapies of interest, and any additional preferences in the text box below. Submit when ready to search trials.
 """
         )
+
         search_query = st.text_area(
             label="Search query",  # accessibility-compliant
-            placeholder="e.g., 30-year-old male with sickle cell disease; on hydroxyurea; in Boston, Massachusetts, United States within 50 km; prefers minimal clinic visits and telemedicine.",
+            placeholder="e.g., metastatic colorectal cancer; on cetuximab; prefers telemedicine and minimal clinic visits.",
             height=110,
             label_visibility="collapsed",  # hides the label from the UI
         )
@@ -134,11 +225,29 @@ Please provide the following details (more information → better results):
         )
 
         spec = parse(search_query)
+
+        if sel_age is not None:
+            spec["age"] = int(sel_age)
+
+        if sel_sex:
+            spec["sex"] = sel_sex
+
+        location_payload = {"city": None, "state": None, "country": None}
+        if sel_country:
+            location_payload["country"] = sel_country
+        if sel_state:
+            location_payload["state"] = sel_state
+        if sel_city:
+            location_payload["city"] = sel_city
+
+        if any(location_payload.values()):
+            spec["location"] = location_payload
+
         grouped = retrieve_with_exclusions(spec, max_trials=10)
         if not grouped:
             loader.empty()
             st.info(
-                "No trials matched your criteria. Try broadening your description (e.g., expand distance or simplify meds)."
+                "No eligible trials found in the current dataset. Please relax your search criteria."
             )
             return
         judged = judge_grouped(spec, grouped)
@@ -148,7 +257,7 @@ Please provide the following details (more information → better results):
 
         if not judged:
             st.info(
-                "No trials matched your criteria. Try broadening your description (e.g., expand distance or simplify meds)."
+                "No eligible trials found in the current dataset. Please relax your search criteria."
             )
             return
 
@@ -189,6 +298,11 @@ Please provide the following details (more information → better results):
         # Show POSSIBLY ELIGIBLE first; collapse INELIGIBLE by default
         possible = [x for x in normalized if x["elig"] == "POSSIBLY ELIGIBLE"]
         ineligible = [x for x in normalized if x["elig"] == "INELIGIBLE"]
+
+        if not possible:
+            st.info(
+                "No eligible trials found in the current dataset. Please relax your search criteria."
+            )
 
         def render_card(item):
             j = item["judge"]
@@ -277,7 +391,7 @@ Please provide the following details (more information → better results):
         """
 <div style="text-align: center; color: #6c757d; padding: 1rem 0 2rem;">
   <p>This tool is for informational purposes only. Always consult a healthcare professional.</p>
-  <p><small>Data sourced from ClinicalTrials.gov</small></p>
+  <p><small>Data sourced from ClinicalTrials.gov (Snapshot: September 19, 2025)</small></p>
 </div>
 """,
         unsafe_allow_html=True,

@@ -12,17 +12,12 @@ def test_parse_llm_mock_basic(monkeypatch):
     monkeypatch.setenv("OPENAI_API_KEY", "test")
 
     expected = {
-        "age": 42,
-        "sex": "FEMALE",
+        "age": None,
+        "sex": None,
         "conditions": ["metastatic breast cancer"],
         "medications": ["letrozole", "palbociclib"],
-        "comorbidities": ["hypertension", "hypothyroidism"],
         "extra_terms": ["oral therapy", "minimal clinic visits"],
-        "location": {
-            "city": "new york city",
-            "state": "ny",
-            "country": "usa",
-        },
+        "location": None,
     }
 
     class _Msg:
@@ -54,8 +49,7 @@ def test_parse_llm_mock_basic(monkeypatch):
 
     text = (
         "42-year-old female with metastatic breast cancer; currently taking letrozole "
-        "and palbociclib; comorbidities include hypertension and hypothyroidism; "
-        "prefers oral therapy and minimal clinic visits; in New York City."
+        "and palbociclib; prefers oral therapy and minimal clinic visits; in New York City."
     )
     spec = qp.parse(text)
 
@@ -66,24 +60,16 @@ def test_build_query_text_deterministic():
     from clinical_rag.query_parser import build_query_text
 
     spec = {
-        "age": 42,
-        "sex": "FEMALE",
+        "age": None,
+        "sex": None,
         "conditions": ["metastatic breast cancer"],
         "medications": ["letrozole", "palbociclib"],
-        "comorbidities": ["metastatic breast cancer"],
         "extra_terms": ["oral therapy", "telemedicine"],
-        "location": {
-            "city": "new york city",
-            "state": "ny",
-            "country": "usa",
-        },
+        "location": None,
     }
 
     q = build_query_text(spec)
-    assert "age:42" in q
-    assert "sex:female" in q
+    assert "sex:" not in q
     assert "conditions:metastatic breast cancer" in q
     assert "meds:letrozole, palbociclib" in q
-    assert "comorbidities:metastatic breast cancer" in q
     assert "context:oral therapy, telemedicine" in q
-    assert "location:new york city ny usa" in q

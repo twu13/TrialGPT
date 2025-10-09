@@ -27,7 +27,7 @@ help:
 
 setup:
 	uv sync
-	source .venv/bin/activate
+	@echo "Activate the virtualenv manually with: source .venv/bin/activate"
 
 pipeline:
 	uv run python -m ingest.main
@@ -56,7 +56,7 @@ app:
 
 up:
 	docker compose up -d --build
-	@echo "Streamlit UI: http://localhost:8501"
+	@echo "TrialGPT: http://localhost:8501"
 	@echo "Qdrant dashboard: http://localhost:6333/dashboard"
 
 down:

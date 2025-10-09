@@ -7,15 +7,18 @@ Returns inclusion/exclusion bullets from the trial payload in a format
 compatible with the judge and app layers.
 """
 
+from collections import defaultdict
 from functools import lru_cache
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from qdrant_client import QdrantClient
 from qdrant_client.http import models as http_models
 from fastembed import TextEmbedding
 from clinical_rag.config import load_settings
 
-from clinical_rag.query_parser import build_query_text
+from typing import OrderedDict as _OrderedDict
+
+from clinical_rag.query_parser import build_query_components, build_query_text
 
 
 _SETTINGS = load_settings()
@@ -115,13 +118,122 @@ class _PayloadWrapper:
         self.payload = payload
 
 
+_COMPONENT_WEIGHTS = {
+    "conditions": 0.50,
+    "medications": 0.25,
+    "extra_terms": 0.25,
+    "sex": 0.0,
+}
+
+
+def _weighted_query_vector(spec: Dict) -> List[float]:
+    components: _OrderedDict[str, str] = build_query_components(spec)
+    items: List[tuple[str, str, float]] = []
+    for name, text in components.items():
+        weight = _COMPONENT_WEIGHTS.get(name, 0.0)
+        if not text or weight <= 0:
+            continue
+        items.append((name, text, weight))
+
+    if not items:
+        # Fallback to a single embedding of whatever query text is available
+        qtext = build_query_text(spec) or " "
+        embedder = _get_embedder()
+        return list(embedder.embed([qtext]))[0]
+
+    total_weight = sum(weight for _, _, weight in items)
+    if total_weight <= 0:
+        qtext = build_query_text(spec) or " "
+        embedder = _get_embedder()
+        return list(embedder.embed([qtext]))[0]
+
+    embedder = _get_embedder()
+    texts = [text for _, text, _ in items]
+    raw_vectors = list(embedder.embed(texts))
+    norm_weights = [weight / total_weight for _, _, weight in items]
+
+    weighted_vector: List[float] | None = None
+    for vec, norm_weight in zip(raw_vectors, norm_weights):
+        scaled = [norm_weight * v for v in vec]
+        if weighted_vector is None:
+            weighted_vector = scaled
+        else:
+            weighted_vector = [a + b for a, b in zip(weighted_vector, scaled)]
+
+    # weighted_vector cannot be None because items is non-empty
+    return weighted_vector or []
+
+
+@lru_cache(maxsize=1)
+def get_location_facets(limit_per_scroll: int = 256) -> Dict[str, object]:
+    """Return unique location options from Qdrant payloads.
+
+    Results include sorted lists of countries, states keyed by country, and cities keyed by (country, state).
+    """
+
+    client = _get_client()
+    collection = _SETTINGS.collection_name
+
+    countries: set[str] = set()
+    states_by_country: Dict[str, set[str]] = defaultdict(set)
+    cities_by_region: Dict[Tuple[str, str], set[str]] = defaultdict(set)
+
+    next_offset = None
+    while True:
+        scroll_result = client.scroll(
+            collection_name=collection,
+            limit=limit_per_scroll,
+            offset=next_offset,
+            with_payload=True,
+            with_vectors=False,
+        )
+
+        if isinstance(scroll_result, tuple):
+            points, next_offset = scroll_result
+        else:  # pragma: no cover - compatibility path
+            points = scroll_result[0]
+            next_offset = scroll_result[1]
+
+        if not points:
+            break
+        for point in points:
+            payload = point.payload or {}
+            for loc in payload.get("locations") or []:
+                if not isinstance(loc, dict):
+                    continue
+                country = (loc.get("country") or "").strip().lower()
+                state = (loc.get("state") or "").strip().lower()
+                city = (loc.get("city") or "").strip().lower()
+                if not country and not state and not city:
+                    continue
+                if country:
+                    countries.add(country)
+                if country and state:
+                    states_by_country[country].add(state)
+                    if city:
+                        cities_by_region[(country, state)].add(city)
+                elif country and city:
+                    cities_by_region[(country, "")].add(city)
+        if next_offset is None:
+            break
+
+    sorted_countries = sorted(countries)
+    sorted_states = {
+        country: sorted(values) for country, values in states_by_country.items()
+    }
+    sorted_cities = {key: sorted(values) for key, values in cities_by_region.items()}
+    return {
+        "countries": sorted_countries,
+        "states_by_country": sorted_states,
+        "cities_by_region": sorted_cities,
+    }
+
+
 def _search_trials(spec: Dict, *, max_trials: int):
     client = _get_client()
     collection = _SETTINGS.collection_name
-    qtext = build_query_text(spec)
     qfilter = build_filters(spec)
-    embedder = _get_embedder()
-    vec = list(embedder.embed([qtext]))[0]
+    vec = _weighted_query_vector(spec)
     hits = client.search(
         collection_name=collection,
         query_vector=vec,

@@ -8,9 +8,10 @@ Usage (programmatic):
     spec = parse("65 y/o male with diabetes, on metformin")
 
 CLI (ad-hoc):
-    uv run python -m clinical_rag.query_parser --text "..." [--model gpt-4o-mini]
+    uv run python -m clinical_rag.query_parser --text "..." [--model MODEL_ID]
 """
 
+from collections import OrderedDict
 from typing import Dict, Optional, Union, List
 import argparse
 import json
@@ -20,34 +21,29 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 
 from clinical_rag.prompts.query_parser_prompt import SYSTEM_PROMPT
+from clinical_rag.config import load_settings
 
 
-class LocationPref(BaseModel):
-    city: Optional[str] = None
-    state: Optional[str] = None
-    country: Optional[str] = None
+_SETTINGS = load_settings()
 
 
 class QuerySpec(BaseModel):
-    age: int | None = Field(default=None)
-    sex: str | None = Field(default=None)
     conditions: list[str] = Field(default_factory=list)
     medications: list[str] = Field(default_factory=list)
-    comorbidities: list[str] = Field(default_factory=list)
     extra_terms: list[str] = Field(default_factory=list)
-    location: Optional[LocationPref] = None
 
     def to_dict(self) -> Dict:
         return self.model_dump()
 
 
-def parse(text: str, *, llm_model: str = "gpt-4o-mini") -> Dict:
+def parse(text: str, *, llm_model: Optional[str] = None) -> Dict:
     if not os.getenv("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is required for LLM parsing")
 
     client = OpenAI()
+    model_to_use = llm_model or _SETTINGS.llm_model_name
     resp = client.chat.completions.create(
-        model=llm_model,
+        model=model_to_use,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": text},
@@ -55,46 +51,53 @@ def parse(text: str, *, llm_model: str = "gpt-4o-mini") -> Dict:
         temperature=0,
     )
     content = resp.choices[0].message.content or "{}"
-    data = json.loads(content)
-    return QuerySpec(**data).to_dict()
+
+    def _coerce_json(raw: str) -> Dict:
+        stripped = raw.strip()
+        if not stripped:
+            return {}
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            start = stripped.find("{")
+            end = stripped.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    return json.loads(stripped[start : end + 1])
+                except json.JSONDecodeError:
+                    pass
+            raise ValueError(
+                "Query parser returned non-JSON content. Received: " + stripped
+            )
+
+    data = _coerce_json(content)
+    for key in ("conditions", "medications", "extra_terms"):
+        value = data.get(key)
+        if value is None:
+            data[key] = []
+    spec = QuerySpec(**data).to_dict()
+    return {**spec, "age": None, "sex": None, "location": None}
 
 
-def build_query_text(spec: Union[Dict, QuerySpec]) -> str:
-    """Construct a deterministic semantic query string from a parsed spec.
-
-    Rules:
-    - Field order: age, sex, conditions, meds, comorbidities, location
-    - Lowercase sex and location tokens, keep numbers as-is
-    - Join multi-values with ", " in a stable order
-    """
+def build_query_components(spec: Union[Dict, QuerySpec]) -> "OrderedDict[str, str]":
+    """Return ordered mapping of semantic query components."""
     if not isinstance(spec, QuerySpec):
         spec = QuerySpec(**spec)
 
-    parts: List[str] = []
-    if spec.age is not None:
-        parts.append(f"age:{spec.age}")
-    if spec.sex:
-        parts.append(f"sex:{spec.sex.lower()}")
+    parts: "OrderedDict[str, str]" = OrderedDict()
     if spec.conditions:
-        parts.append("conditions:" + ", ".join(spec.conditions))
+        parts["conditions"] = "conditions:" + ", ".join(spec.conditions)
     if spec.medications:
-        parts.append("meds:" + ", ".join(spec.medications))
-    if spec.comorbidities:
-        parts.append("comorbidities:" + ", ".join(spec.comorbidities))
+        parts["medications"] = "meds:" + ", ".join(spec.medications)
     if spec.extra_terms:
-        parts.append("context:" + ", ".join(spec.extra_terms))
+        parts["extra_terms"] = "context:" + ", ".join(spec.extra_terms)
+    return parts
 
-    if spec.location:
-        loc_tokens: List[str] = []
-        if spec.location.city:
-            loc_tokens.append(spec.location.city.lower())
-        if spec.location.state:
-            loc_tokens.append(spec.location.state.lower())
-        if spec.location.country:
-            loc_tokens.append(spec.location.country.lower())
-        if loc_tokens:
-            parts.append("location:" + " ".join(loc_tokens))
-    return " ".join(parts)
+
+def build_query_text(spec: Union[Dict, QuerySpec]) -> str:
+    """Construct a deterministic semantic query string from a parsed spec."""
+    components = build_query_components(spec)
+    return " ".join(components.values())
 
 
 def main() -> None:
@@ -105,7 +108,10 @@ def main() -> None:
         "--text", type=str, required=True, help="Patient free-text input"
     )
     parser.add_argument(
-        "--model", type=str, default="gpt-4o-mini", help="OpenAI chat model id"
+        "--model",
+        type=str,
+        default=_SETTINGS.llm_model_name,
+        help="OpenAI chat model id (defaults to LLM_MODEL_NAME or project default)",
     )
     args = parser.parse_args()
 

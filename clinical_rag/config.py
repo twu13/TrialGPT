@@ -30,6 +30,7 @@ class Settings:
     data_end_date: Optional[date]
     ctgov_api_base: str
     embedding_model_name: str
+    llm_model_name: str
     allowed_statuses: list[str]
 
 
@@ -41,6 +42,7 @@ DEFAULT_ALLOWED_STATUSES = [
 ]
 
 DEFAULT_EMBEDDING_MODEL_NAME = "BAAI/bge-small-en-v1.5"
+DEFAULT_LLM_MODEL_NAME = "gpt-4o"
 
 
 def load_settings() -> Settings:
@@ -58,6 +60,7 @@ def load_settings() -> Settings:
         data_end_date=_parse_date("DATA_END_DATE"),
         ctgov_api_base=os.getenv("CTGOV_API_BASE", "https://clinicaltrials.gov/api/v2"),
         embedding_model_name=DEFAULT_EMBEDDING_MODEL_NAME,
+        llm_model_name=os.getenv("LLM_MODEL_NAME", DEFAULT_LLM_MODEL_NAME),
         allowed_statuses=DEFAULT_ALLOWED_STATUSES,
     )
 

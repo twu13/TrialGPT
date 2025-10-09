@@ -9,18 +9,22 @@ import json
 import os
 import re
 from functools import lru_cache
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from openai import OpenAI
 
 from clinical_rag.query_parser import parse
 from clinical_rag.retrieval import retrieve_with_exclusions
 from clinical_rag.prompts.judge_prompt import SYSTEM_PROMPT
+from clinical_rag.config import load_settings
 
 
 @lru_cache(maxsize=1)
 def _get_client() -> OpenAI:
     return OpenAI()
+
+
+_SETTINGS = load_settings()
 
 
 def _fmt_all_trials_context(
@@ -29,6 +33,15 @@ def _fmt_all_trials_context(
     parts: List[str] = []
     for nct_id, ctx in grouped.items():
         parts.append(f"TRIAL: {nct_id}")
+        info = ctx.get("info", {})
+        title = info.get("trial_title") or ""
+        conditions = info.get("conditions") or []
+        if title:
+            parts.append(f"Title: {title}")
+        if conditions:
+            joined_conditions = ", ".join([str(c) for c in conditions if c])
+            if joined_conditions:
+                parts.append(f"Conditions: {joined_conditions}")
         parts.append("Inclusion bullets:")
         for h in ctx.get("incl", [])[:max_incl]:
             p = h.payload or {}
@@ -45,7 +58,7 @@ def judge_from_text(
     text: str,
     *,
     max_trials: int = 10,
-    model: str = "gpt-4o-mini",
+    model: Optional[str] = None,
     verbose: bool = False,
 ) -> List[Dict]:
     """Single LLM call that judges all shortlisted trials (up to max_trials) in one response."""
@@ -82,8 +95,9 @@ def judge_from_text(
         print("--- USER ---")
         print(user_content)
 
+    model_name = model or _SETTINGS.llm_model_name
     resp = client.chat.completions.create(
-        model=model,
+        model=model_name,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + schema_note},
             {"role": "user", "content": user_content},
@@ -143,7 +157,7 @@ def judge_grouped(
     spec: Dict,
     grouped: Dict[str, Dict[str, List]],
     *,
-    model: str = "gpt-4o-mini",
+    model: Optional[str] = None,
     verbose: bool = False,
 ) -> List[Dict]:
     """Judge already-retrieved trials (no parsing or retrieval inside).
@@ -182,8 +196,9 @@ def judge_grouped(
         print("--- USER ---")
         print(user_content)
 
+    model_name = model or _SETTINGS.llm_model_name
     resp = client.chat.completions.create(
-        model=model,
+        model=model_name,
         messages=[
             {"role": "system", "content": SYSTEM_PROMPT + "\n" + schema_note},
             {"role": "user", "content": user_content},
